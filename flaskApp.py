@@ -90,4 +90,4 @@ def ask_question():
     return jsonify({'response': response}), 200
 
 if __name__ == "__main__":
-    app.run(debug=True , port = 8510)
+    app.run(debug=True , port = 8510, host="0.0.0.0")
