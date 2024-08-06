@@ -7,19 +7,26 @@ import pdfplumber
 from configparser import ConfigParser
 from dotenv import load_dotenv
 from pymilvus import connections, Collection, utility
-from langchain.embeddings import HuggingFaceInstructEmbeddings
-from langchain.vectorstores import Milvus
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import CrossEncoder
 from ibm_watson_machine_learning.foundation_models import Model
 from ibm_watson_machine_learning.metanames import GenTextParamsMetaNames as GenParams
 from prompt import prompt_generator
 from sentence_transformers import SentenceTransformer
-import streamlit as st
-from io import BytesIO
+from langchain_community.embeddings import HuggingFaceInstructEmbeddings
+from langchain_community.vectorstores import Milvus
+
+
+import logging
+import warnings
+# Suppress all warnings
+warnings.filterwarnings("ignore")
+
+
+flag = False
 
 class ZiraatBankQA:
-    def __init__(self, config_path):
+    def __init__(self, config_path, logger=None):
         self.config = self.load_config(config_path)
         self.creds, self.project_id = self.get_wml_creds()
         self.model_id = self.config['DEFAULT']['ModelID']
@@ -31,13 +38,14 @@ class ZiraatBankQA:
             chunk_overlap=150,
             length_function=len
         )
-        self.collection_name = self.config['Milvus']['CollectionName']
+        self.collection_name = os.getenv("CollectionName", None)
         self.host = self.config['Milvus']['Host']
         self.port = self.config['Milvus']['Port']
         self.user = self.config['Milvus']['User']
-        self.password =  os.getenv('milvus_password',None)
+        self.password = os.getenv('milvus_password', None)
         self.server_pem_path = self.config['Milvus']['ServerPemPath']
         self.server_name = self.config['Milvus']['ServerName']
+        self.logger = logger if logger else logging.getLogger(__name__)
 
     def load_config(self, config_path):
         config = ConfigParser()
@@ -81,6 +89,7 @@ class ZiraatBankQA:
         return text_chunks
 
     def create_vector_store(self, text_chunks):
+        self.logger.info("Starting connection to Milvus.")
         connections.connect(
             "default",
             host=self.host,
@@ -91,25 +100,44 @@ class ZiraatBankQA:
             user=self.user,
             password=self.password
         )
-        if utility.has_collection(self.collection_name):
-            utility.drop_collection(self.collection_name)
 
-        vector_db = Milvus.from_documents(
-            text_chunks,
-            self.embeddings,
-            connection_args={
-                "host": self.host,
-                "port": self.port,
-                "secure": True,
-                "server_pem_path": self.server_pem_path,
-                "server_name": self.server_name,
-                "user": self.user,
-                "password": self.password
-            },
-            collection_name=self.collection_name
-        )
-        collection = Collection(self.collection_name)
-        collection.load()
+        self.logger.info("Checking if collection exists.")
+        if utility.has_collection(self.collection_name):
+            self.logger.info(f"***** Collection '{self.collection_name}' already exists. Using the existing collection.")
+            vector_db = Milvus(
+                collection_name=self.collection_name,
+                embedding_function=self.embeddings,
+                connection_args={
+                    "host": self.host,
+                    "port": self.port,
+                    "secure": True,
+                    "server_pem_path": self.server_pem_path,
+                    "server_name": self.server_name,
+                    "user": self.user,
+                    "password": self.password
+                }
+            )
+        else:
+            self.logger.info(f"Collection '{self.collection_name}' does not exist. Creating a new collection.")
+            vector_db = Milvus.from_documents(
+                text_chunks,
+                self.embeddings,
+                connection_args={
+                    "host": self.host,
+                    "port": self.port,
+                    "secure": True,
+                    "server_pem_path": self.server_pem_path,
+                    "server_name": self.server_name,
+                    "user": self.user,
+                    "password": self.password
+                },
+                collection_name=self.collection_name
+            )
+            self.logger.info(f"Collection '{self.collection_name}' created successfully.")
+            collection = Collection(self.collection_name)
+            collection.load()
+        
+        self.logger.info("Vector store creation process complete.")
         return vector_db
 
     def perform_qa(self, df, query):
@@ -137,6 +165,9 @@ class ZiraatBankQA:
                 }
             )
 
+        if not vector_db:
+            raise ValueError("Collection does not exist or could not be loaded.")
+        
         docs = vector_db.similarity_search_with_score(query, k=15, ef=7)
         model = CrossEncoder('emrecan/bert-base-turkish-cased-mean-nli-stsb-tr', max_length=512)
         _docs = pd.DataFrame(
@@ -147,8 +178,5 @@ class ZiraatBankQA:
         _docs['score'] = scores
         df = _docs[:15]
         response, context = self.perform_qa(df, query)
+        self.logger.info(f"Response: {response}")
         return response, context
-
-#------------------------------------------------------------------------------------------------------------------------------------------------
-
-
